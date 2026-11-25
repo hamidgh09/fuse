@@ -7,6 +7,9 @@ package fs
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -29,16 +32,32 @@ type retirerTestNode struct {
 	registers int32
 	retires   int32
 	retired   bool
+
+	server      *Server // when set, the hooks check that server.meta is held
+	unlocked    int32   // hook calls that found server.meta free
+	retirePanic bool
+}
+
+func (n *retirerTestNode) checkMetaHeld() {
+	if n.server != nil && n.server.meta.TryLock() {
+		n.server.meta.Unlock()
+		atomic.AddInt32(&n.unlocked, 1)
+	}
 }
 
 func (n *retirerTestNode) RegisterLocked() bool {
+	n.checkMetaHeld()
 	atomic.AddInt32(&n.registers, 1)
 	return !n.retired
 }
 
 func (n *retirerTestNode) RetireLocked() {
+	n.checkMetaHeld()
 	atomic.AddInt32(&n.retires, 1)
 	n.retired = true
+	if n.retirePanic {
+		panic("retire hook panicked")
+	}
 }
 
 var _ NodeRetirer = (*retirerTestNode)(nil)
@@ -73,10 +92,18 @@ func TestInternalSaveNodeRegistersOnce(t *testing.T) {
 
 func TestInternalDropNodeRetiresUnderMeta(t *testing.T) {
 	s := newInternalTestServer()
-	n := &retirerTestNode{}
+	n := &retirerTestNode{server: s}
 	id, _, _ := s.saveNode(42, n)
 
 	node, forget := s.dropNode(id, 1)
+	s.saveNode(42, n) // refused; RegisterLocked runs again
+
+	if got := atomic.LoadInt32(&n.registers); got != 2 {
+		t.Fatalf("RegisterLocked called %d times, want 2", got)
+	}
+	if got := atomic.LoadInt32(&n.unlocked); got != 0 {
+		t.Fatalf("%d hook calls ran without the server's metadata lock", got)
+	}
 
 	if node != Node(n) {
 		t.Fatalf("dropNode returned node %v, want the retirer", node)
@@ -174,6 +201,92 @@ func TestInternalForgetOneRetirerNoForget(t *testing.T) {
 	if atomic.LoadInt32(&n.retires) != 1 || atomic.LoadInt32(&n.forgets) != 0 {
 		t.Fatalf("retirer must be retired exactly once and never Forget-ed: retires=%d forgets=%d",
 			n.retires, n.forgets)
+	}
+}
+
+type panickingForgetNode struct{ plainTestNode }
+
+func (n *panickingForgetNode) Forget() { panic("forget hook panicked") }
+
+// With InlineForget these hooks run on the request-reading goroutine, where
+// a panic would end Serve.
+func TestInternalForgetOneSurvivesAPanickingHook(t *testing.T) {
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(os.Stderr)
+	s := newInternalTestServer()
+	retirer := &retirerTestNode{retirePanic: true}
+	retirerID, _, _ := s.saveNode(42, retirer)
+	forgetter := &panickingForgetNode{}
+	forgetterID, _, _ := s.saveNode(43, forgetter)
+	after := &plainTestNode{}
+	afterID, _, _ := s.saveNode(44, after)
+
+	s.forgetOne(retirerID, 1)
+	s.forgetOne(forgetterID, 1)
+	s.forgetOne(afterID, 1)
+
+	if !s.meta.TryLock() {
+		t.Fatalf("a panicking RetireLocked left the metadata lock held")
+	}
+	s.meta.Unlock()
+	if len(s.nodeRef) != 0 {
+		t.Fatalf("nodeRef still holds %d nodes", len(s.nodeRef))
+	}
+	if got := atomic.LoadInt32(&after.forgets); got != 1 {
+		t.Fatalf("the node forgotten after the panics got %d Forget calls, want 1", got)
+	}
+}
+
+type abandonTestHandle struct{ abandons int32 }
+
+func (h *abandonTestHandle) Abandon(ctx context.Context) { atomic.AddInt32(&h.abandons, 1) }
+
+type createTestDir struct {
+	plainTestNode
+	child  Node
+	handle Handle
+}
+
+func (d *createTestDir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (Node, Handle, error) {
+	return d.child, d.handle, nil
+}
+
+type attrErrorTestNode struct{}
+
+func (attrErrorTestNode) Attr(ctx context.Context, a *fuse.Attr) error { return syscall.EIO }
+
+// A Create that the server fails after the filesystem returned a handle gets
+// no Release, so the handle is handed back. A successful Create is not tested
+// here: its reply needs a connection.
+func TestInternalFailedCreateAbandonsItsHandle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		child Node
+		want  syscall.Errno
+	}{
+		{"attr error", attrErrorTestNode{}, syscall.EIO},
+		{"registration refused", &retirerTestNode{retired: true}, syscall.ESTALE},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newInternalTestServer()
+			handle := &abandonTestHandle{}
+			dir := &createTestDir{child: tc.child, handle: handle}
+			snode := &serveNode{inode: 1, node: dir}
+			handles := len(s.handle)
+
+			err := s.handleRequest(context.Background(), dir, snode, &fuse.CreateRequest{Name: "f"},
+				func(interface{}) { t.Errorf("a failed Create must not complete a reply") })
+
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			if got := atomic.LoadInt32(&handle.abandons); got != 1 {
+				t.Fatalf("Abandon called %d times, want 1", got)
+			}
+			if len(s.handle) != handles {
+				t.Fatalf("a failed Create saved its handle")
+			}
+		})
 	}
 }
 

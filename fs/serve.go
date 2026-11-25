@@ -619,6 +619,15 @@ func (s *Server) serveForget(r fuse.Request) {
 // the node's Forget hook when the count reaches zero. NodeRetirer nodes are
 // retired inside dropNode (under c.meta); plain nodes get Forget here.
 func (s *Server) forgetOne(id fuse.NodeID, n uint64) {
+	// The recovery in serve does not cover the request-reading goroutine,
+	// where a panicking hook would end Serve.
+	defer func() {
+		if rec := recover(); rec != nil {
+			buf := make([]byte, 1<<16)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("fuse: panic forgetting node %v: %v\n%s", id, rec, buf)
+		}
+	}()
 	node, forget := s.dropNode(id, n)
 	if node == nil || !forget {
 		return
