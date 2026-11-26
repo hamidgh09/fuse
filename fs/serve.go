@@ -225,9 +225,15 @@ type NodeRetirer interface {
 	// RegisterLocked is called before the server starts tracking this node
 	// for an entry reply (Lookup, Create, Mkdir, Symlink, Link, Mknod). It
 	// is not called when the server already tracks the node. Returning
-	// false refuses the registration and fails the reply with ESTALE, which
-	// makes the kernel repeat the lookup. A node must return false once
-	// RetireLocked has been called on it.
+	// false refuses the registration and fails the reply with ESTALE. A
+	// node must return false once RetireLocked has been called on it.
+	//
+	// The kernel answers ESTALE on a Lookup by repeating the lookup. On a
+	// creating operation (Create, Mkdir, Symlink, Mknod) the filesystem has
+	// already made the entry, and the kernel repeats the whole system call
+	// once, which then fails with EEXIST for an exclusive create or a
+	// mkdir. A creating operation must therefore return a node that cannot
+	// have retired: one made for that call, never one taken from a cache.
 	RegisterLocked() bool
 	// RetireLocked is called when the server's reference count for this
 	// node reaches zero, in place of Forget.
@@ -473,17 +479,23 @@ type Config struct {
 	// in-flight request).
 	//
 	// Only enable this when Forget and RetireLocked implementations never
-	// block, and when the only kernel notification the filesystem sends is
-	// InvalidateEntry.
+	// block.
 	//
 	// dropNode waits, holding the server's metadata lock, for in-flight
-	// notifications on the node it frees. InvalidateEntry holds only the
-	// parent directory, and the kernel forgets a directory only once
-	// nothing uses it, so that write cannot be queued behind a request on
-	// the directory. NotifyDelete also holds the child, whose FORGET can
-	// arrive while the write waits for a request that needs the metadata
-	// lock to finish. NotifyRetrieve needs the reading goroutine to deliver
-	// its reply. Both return ErrInlineForget on a server with this set.
+	// notifications on the node it frees, and with this set it waits on
+	// the goroutine that reads requests. Two notifications can deadlock
+	// against that, and return ErrInlineForget on a server with this set.
+	// NotifyDelete holds the child, whose FORGET can arrive while the
+	// write waits for a request that needs the metadata lock to finish.
+	// NotifyRetrieve needs the reading goroutine to deliver its reply.
+	//
+	// InvalidateEntry is safe: it holds only the parent directory, and the
+	// kernel forgets a directory only once nothing uses it, so the write
+	// cannot be queued behind a request on the directory. The
+	// InvalidateNode calls and NotifyStore are not refused. The kernel
+	// sends a node's last FORGET only after it evicted the inode, and these
+	// notifications fail at once on an evicted inode, so the same reasoning
+	// covers them, but no test here runs them with InlineForget.
 	InlineForget bool
 }
 
